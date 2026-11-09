@@ -1,0 +1,17 @@
+[project]
+name = "chtc-gpu-smoke"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = ["torch==2.5.1"]
+
+[tool.uv]
+package = false
+
+# A known CUDA wheel variant, rather than whichever GPU stack PyPI selects.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }

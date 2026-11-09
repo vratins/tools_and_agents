@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""Small, dependency-free uv/container/HTCondor workflow (Python 3.9+)."""
+import argparse
+import datetime
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import uuid
+
+EXCLUDED = {'.git', '.venv', 'venv', '__pycache__', '.cache', '.aws', '.ssh',
+            '.codex', '.agents', '.vscode-server', '.chtc', 'node_modules',
+            'data', 'datasets', 'outputs', 'results', 'wandb', '.pytest_cache',
+            '.python', '.apptainer-cache', '.apptainer-tmp', '.jupyter-runtime'}
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def clean(value):
+    value = str(value)
+    if any(c in value for c in '\n\r\x00') or '$(' in value:
+        fail('Newlines, NUL, and HTCondor macro expressions are not allowed in paths/options')
+    return value
+
+
+def quoted(value):
+    return '"' + clean(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def write(path, text, executable=False):
+    path.write_text(text)
+    path.chmod(0o700 if executable else 0o600)
+
+
+def command(argv, cwd=None):
+    print('+ ' + shlex.join([str(x) for x in argv]), flush=True)
+    subprocess.run([str(x) for x in argv], cwd=cwd, check=True)
+
+
+def new_dir(root, kind):
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    path = root / (kind + '-' + stamp + '-' + uuid.uuid4().hex[:8])
+    path.mkdir(parents=True, mode=0o700)
+    return path
+
+
+def snapshot(project, output, patterns, limit_mb):
+    """Never follow symlinks or include credentials/caches. Bound total source size."""
+    total = 0
+    selected = []
+    for parent, dirs, files in os.walk(project, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED
+                         and not (Path(parent) / d).is_symlink()
+                         and not any(fnmatch.fnmatch((Path(parent) / d).relative_to(project).as_posix(), p)
+                                     for p in patterns))
+        for name in sorted(files):
+            path = Path(parent) / name
+            relative = path.relative_to(project).as_posix()
+            if (path.is_symlink() or not path.is_file() or name == '.env'
+                    or name.startswith('.env.') or name.endswith(('.pem', '.key'))
+                    or any(fnmatch.fnmatch(relative, p) for p in patterns)):
+                continue
+            total += path.stat().st_size
+            if total > limit_mb * 1024 * 1024:
+                fail('Source snapshot exceeds --max-source-mb; exclude data with --exclude')
+            selected.append((path, relative))
+    if not selected:
+        fail('Source snapshot is empty')
+    with tarfile.open(output, 'w:gz') as archive:
+        for path, relative in selected:
+            archive.add(path, arcname=relative, recursive=False)
+    return hashlib.sha256(output.read_bytes()).hexdigest(), {rel for _, rel in selected}
+
+
+WORKER = r'''#!/bin/bash
+set -euo pipefail
+cd "${_CONDOR_SCRATCH_DIR:-$PWD}"
+job_root="$PWD"
+export XDG_CACHE_HOME="$job_root/.cache"
+export UV_CACHE_DIR="$XDG_CACHE_HOME/uv"
+export HF_HOME="$XDG_CACHE_HOME/huggingface"
+export TORCH_HOME="$XDG_CACHE_HOME/torch"
+export TRITON_CACHE_DIR="$XDG_CACHE_HOME/triton"
+export JUPYTER_RUNTIME_DIR="$job_root/.jupyter-runtime"
+export TMPDIR="$job_root/tmp"
+mkdir -p "$TMPDIR" "$JUPYTER_RUNTIME_DIR" outputs project
+chmod 700 "$JUPYTER_RUNTIME_DIR"
+tar -xzf source.tar.gz -C project
+export CHTC_OUTPUT_DIR="$job_root/outputs"
+export CHTC_INPUT_DIR="$job_root"
+export PYTHONPATH="$job_root/project/src:$job_root/project${PYTHONPATH:+:$PYTHONPATH}"
+cd project
+if [[ "${1:-}" == --interactive ]]; then
+    echo "Worker project: $PWD"
+    echo "Save results to $CHTC_OUTPUT_DIR and copy valuable files out before exit."
+    echo "This is a snapshot; edits on the access point do not sync here."
+    exec /bin/bash --norc -i
+fi
+python - <<'PY'
+import json, os, subprocess, sys
+from pathlib import Path
+root = Path.cwd().parent
+manifest = json.loads((root / 'run.json').read_text())
+result = subprocess.run([sys.executable, manifest['script'], *manifest['args']])
+(root / 'outputs' / 'run.json').write_text(json.dumps(manifest, indent=2))
+(root / 'outputs' / 'exit-code.txt').write_text(str(result.returncode) + '\n')
+sys.exit(result.returncode)
+PY
+'''
+
+
+def image_ref(value):
+    clean(value)
+    if value.startswith(('docker://', 'osdf://', 'https://', 'http://', 'file://')):
+        return value
+    if value.endswith('.sif') or value.startswith(('/', './', '../')):
+        path = Path(value).expanduser().resolve()
+        if not path.is_file():
+            fail('Container file does not exist: ' + str(path))
+        return str(path)
+    return 'docker://' + value
+
+
+def resources(parser):
+    parser.add_argument('--cpus', type=int, default=4)
+    parser.add_argument('--gpus', type=int, default=0)
+    parser.add_argument('--memory', default='16GB')
+    parser.add_argument('--disk', default='30GB')
+    parser.add_argument('--gpu-memory-mb', type=int, help='Minimum VRAM per GPU, in MiB')
+
+
+def validate_resources(args):
+    if args.cpus < 1 or args.gpus < 0:
+        fail('--cpus must be positive; --gpus must be nonnegative')
+    for value in (args.memory, args.disk):
+        if not re.fullmatch(r'[1-9][0-9]*(?:\.[0-9]+)?(?:KB|MB|GB|TB)', value, re.I):
+            fail('Resource sizes require units, e.g. 16GB')
+    if args.gpu_memory_mb is not None and (args.gpus == 0 or args.gpu_memory_mb < 1):
+        fail('--gpu-memory-mb requires --gpus > 0 and a positive value')
+
+
+def launch(args):
+    validate_resources(args)
+    project = Path(args.project).expanduser().resolve()
+    if not project.is_dir():
+        fail('Project directory does not exist')
+    image = image_ref(args.image)
+    run = new_dir(project / '.chtc' / 'runs', args.mode)
+    script = None
+    if args.mode == 'submit':
+        candidate = (project / args.script).resolve()
+        try:
+            script = candidate.relative_to(project).as_posix()
+        except ValueError:
+            fail('Script must be inside --project')
+        if not candidate.is_file():
+            fail('Script does not exist: ' + str(candidate))
+    digest, members = snapshot(project, run / 'source.tar.gz', args.exclude, args.max_source_mb)
+    if script and script not in members:
+        fail('Script was excluded from the source snapshot')
+    trailing = getattr(args, 'script_args', [])
+    if trailing[:1] == ['--']:
+        trailing = trailing[1:]
+    manifest = dict(project=str(project), image=image, script=script, args=trailing,
+                    source_sha256=digest, resources=dict(cpus=args.cpus, gpus=args.gpus,
+                    memory=args.memory, disk=args.disk, gpu_memory_mb=args.gpu_memory_mb))
+    write(run / 'run.json', json.dumps(manifest, indent=2) + '\n')
+    write(run / 'worker.sh', WORKER, executable=True)
+    inputs = ['source.tar.gz', 'run.json']
+    names = set(inputs + ['worker.sh', 'project', 'outputs'])
+    for item in args.input:
+        clean(item)
+        name = item.rstrip('/').rsplit('/', 1)[-1]
+        if name in names or not name:
+            fail('Input basenames must be unique and cannot use reserved names: ' + name)
+        if ',' in item or '"' in item or ';' in item:
+            fail('Input paths must not contain commas, quotes, or semicolons')
+        names.add(name)
+        if '://' not in item:
+            path = Path(item).expanduser().resolve()
+            if not path.exists():
+                fail('Input does not exist: ' + str(path))
+            item = str(path)
+        inputs.append(item)
+    lines = ['initialdir = ' + quoted(run),
+             'universe = container', 'container_image = ' + quoted(image),
+             'executable = worker.sh', 'should_transfer_files = YES',
+             'when_to_transfer_output = ON_EXIT',
+             'transfer_input_files = ' + ','.join(quoted(x) for x in inputs),
+             'request_cpus = ' + str(args.cpus), 'request_gpus = ' + str(args.gpus),
+             'request_memory = ' + args.memory, 'request_disk = ' + args.disk,
+             'log = events.log', 'output = stdout.txt', 'error = stderr.txt',
+             'getenv = False']
+    if args.mode == 'submit':
+        (run / 'results').mkdir()
+        lines += ['transfer_output_files = outputs',
+                  'transfer_output_remaps = "outputs=results"']
+    else:
+        # Docker interactive jobs do not return files automatically on CHTC.
+        lines += ['transfer_output_files = ""']
+    if args.gpu_memory_mb:
+        lines += ['gpus_minimum_memory = ' + str(args.gpu_memory_mb)]
+    if image.startswith('osdf://') or any(x.startswith(('osdf://', 'file:///staging/')) for x in inputs):
+        lines += ['requirements = (HasCHTCStaging == true)']
+    lines += ['queue 1', '']
+    write(run / 'job.sub', '\n'.join(lines))
+    print('Run directory: ' + str(run))
+    if args.mode == 'interactive':
+        print('Once the worker shell opens, run: bash worker.sh --interactive')
+        print('Interactive files are temporary: copy results out BEFORE exiting.')
+    if args.prepare:
+        print('Prepared only. Launch with: ' + shlex.join(['condor_submit'] +
+              (['-i'] if args.mode == 'interactive' else []) + [str(run / 'job.sub')]))
+        print('Run that command from: ' + str(run))
+    else:
+        command(['condor_submit'] + (['-i'] if args.mode == 'interactive' else []) + ['job.sub'], cwd=run)
+
+
+def build(args):
+    project = Path(args.project).expanduser().resolve()
+    if not args.venv:
+        for name in ('pyproject.toml', 'uv.lock'):
+            if not (project / name).is_file():
+                fail('Expected ' + name + '; create and lock the uv project first, or use --venv')
+    if not re.fullmatch(r'[A-Za-z0-9_./:@-]+', args.base):
+        fail('Invalid base image reference')
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', args.uv_version):
+        fail('--uv-version must be an exact release, e.g. 0.12.23')
+    if args.execute:
+        args.backend = 'docker'
+    output = Path(args.output).expanduser().absolute() if args.output else None
+    if output and args.backend == 'docker':
+        fail('--output is for SIF builds; Docker builds use --tag')
+    if output and (output.suffix != '.sif' or output.exists() or output.is_symlink()):
+        fail('--output must be a new .sif file; existing images are never overwritten')
+    validate_resources(args)
+    context = new_dir(project / '.chtc' / 'builds', 'image')
+    if output is None:
+        output = project / '.chtc' / 'images' / (context.name + '.sif')
+    # Only dependency metadata is needed to build the environment. Do not copy
+    # project data or a venv (including custom names such as gen_env) into context.
+    # Export only dependencies: never embed a host .venv or editable project paths.
+    if args.venv:
+        if args.extra:
+            fail('--extra applies to lockfile builds, not --venv')
+        interpreter = (project / args.venv / 'bin' / 'python').absolute()
+        result = subprocess.run(['uv', '--no-cache', 'pip', 'freeze', '--python', str(interpreter)],
+                                cwd=project, check=True, capture_output=True, text=True)
+        write(context / 'requirements.txt', result.stdout)
+        print('Exported installed venv packages; use the same Python minor version in --base.')
+    else:
+        export = ['uv', 'export', '--locked', '--no-dev', '--no-emit-project',
+                  '--no-emit-workspace', '--no-hashes', '--emit-index-url', '--output-file',
+                  str(context / 'requirements.txt')]
+        for extra in args.extra:
+            export += ['--extra', extra]
+        command(export, cwd=project)
+    reqs = (context / 'requirements.txt').read_text()
+    if args.index_url:
+        clean(args.index_url)
+        if not args.index_url.startswith('https://') or any(c.isspace() for c in args.index_url):
+            fail('--index-url must be an HTTPS URL without whitespace')
+        reqs = '--index-url ' + args.index_url + '\n' + reqs
+        write(context / 'requirements.txt', reqs)
+    for line in reqs.splitlines():
+        value = line.strip()
+        if value.startswith(('-e ', './', '../', '/', 'file:')) or ' @ file:' in value:
+            fail('Local/path dependencies need an explicit custom image recipe: ' + value)
+    uv_image = 'ghcr.io/astral-sh/uv:' + args.uv_version
+    dockerfile = f'''FROM {uv_image} AS uv
+FROM {args.base}
+COPY --from=uv /uv /uvx /usr/local/bin/
+COPY requirements.txt /tmp/requirements.txt
+RUN uv venv --python python3 /opt/venv && uv pip install --python /opt/venv/bin/python --no-cache -r /tmp/requirements.txt
+ENV PATH="/opt/venv/bin:$PATH"
+WORKDIR /work
+'''
+    write(context / 'Dockerfile', dockerfile)
+    # A minimal context avoids sending source data/secrets to the Docker daemon.
+    write(context / '.dockerignore', '*\n!Dockerfile\n!requirements.txt\n')
+    definition = f'''Bootstrap: docker
+From: {uv_image}
+Stage: uv
+
+Bootstrap: docker
+From: {args.base}
+Stage: final
+
+%files from uv
+    /uv /usr/local/bin/uv
+
+%files
+    requirements.txt /tmp/requirements.txt
+
+%post
+    set -eu
+    /usr/local/bin/uv venv --python python3 /opt/venv
+    /usr/local/bin/uv pip install --python /opt/venv/bin/python --no-cache -r /tmp/requirements.txt
+
+%environment
+    export PATH=/opt/venv/bin:$PATH
+'''
+    write(context / 'image.def', definition)
+    write(context / 'build.sh', '''#!/bin/bash
+set -euo pipefail
+: "${_CONDOR_SCRATCH_DIR:?Build on an allocated CHTC build worker}"
+cd "$_CONDOR_SCRATCH_DIR"
+# Transfer a status and placeholder even on failure so Condor can return logs
+# rather than holding the job for a missing output. The client never publishes
+# the placeholder as the final image.
+trap 'status=$?; printf "{\\"exit_code\\":%s}\\n" "$status" > build-status.json; test -e image.sif || touch image.sif' EXIT
+export APPTAINER_CACHEDIR="$PWD/.apptainer-cache"
+export APPTAINER_TMPDIR="$PWD/.apptainer-tmp"
+mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+apptainer build image.sif image.def
+apptainer exec image.sif /opt/venv/bin/python --version
+echo "Image built and Python checked; HTCondor will return it to the requested destination."
+''', executable=True)
+    partial = output.parent / ('.' + output.name + '.' + uuid.uuid4().hex[:8] + '.partial')
+    for path in (partial, context / 'build-status.json'):
+        clean(path)
+        if any(c in str(path) for c in ';="\\'):
+            fail('Build output paths cannot contain semicolons, equals signs, quotes, or backslashes')
+    write(context / 'build.sub', f'''initialdir = {quoted(context)}
+universe = vanilla
+executable = build.sh
++IsBuildJob = true
+request_cpus = {args.cpus}
+request_memory = {args.memory}
+request_disk = {args.disk}
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+transfer_input_files = image.def,requirements.txt
+transfer_output_files = image.sif,build-status.json
+transfer_output_remaps = "image.sif={clean(partial)};build-status.json={clean(context / 'build-status.json')}"
+getenv = False
+log = build.log
+output = build.out
+error = build.err
+queue 1
+''')
+    write(context / 'build-state.json', json.dumps(dict(output=str(output), partial=str(partial)), indent=2) + '\n')
+    print('Build context: ' + str(context))
+    print('Base image must supply python3 with the intended Python minor version.')
+    if args.prepare:
+        print('Prepared only; no image built and no job submitted.')
+        print('Build with: ' + shlex.join([str(Path(__file__).resolve()), 'build', '--resume', str(context)]))
+        print('Optional Docker build: ' + shlex.join(['docker', 'build', '--platform', 'linux/amd64', '-t', args.tag, str(context)]))
+        return
+    if args.backend == 'docker':
+        if os.environ.get('_CONDOR_SCRATCH_DIR') is None and re.match(r'ap[0-9]+', os.uname().nodename):
+            fail('Docker builds must not run on the login node; use the default CHTC build or workstation/CI.')
+        if not shutil.which('docker'):
+            fail('Docker is not installed here; use the default Apptainer backend')
+        command(['docker', 'build', '--platform', 'linux/amd64', '-t', args.tag, str(context)])
+        print('Docker image ready: ' + args.tag)
+        print('Publish explicitly with: ' + shlex.join(['docker', 'push', args.tag]))
+        return
+    finish_build(context)
+
+
+def finish_build(context):
+    """Submit or resume a CPU build, then publish only a verified successful image."""
+    context = Path(context).expanduser().resolve()
+    state_path = context / 'build-state.json'
+    state = json.loads(state_path.read_text())
+    output, partial = Path(state['output']), Path(state['partial'])
+    if output.exists() or output.is_symlink():
+        fail('Output already exists; choose a new versioned image path: ' + str(output))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if 'job_id' not in state:
+        result = subprocess.run(['condor_submit', '-terse', 'build.sub'], cwd=context,
+                                check=True, capture_output=True, text=True)
+        match = re.match(r'\s*(\d+\.\d+)', result.stdout)
+        if not match:
+            fail('Cannot parse submitted job ID; inspect scheduler before retrying: ' + result.stdout)
+        state['job_id'] = match.group(1)
+        write(state_path, json.dumps(state, indent=2) + '\n')
+    job_id = state['job_id']
+    print('Build job: ' + job_id, flush=True)
+    print('Waiting for build and image transfer. Logs: ' + str(context / 'build.log'), flush=True)
+    print('If interrupted, resume with: chtc build --resume ' + shlex.quote(str(context)), flush=True)
+    try:
+        while not (context / 'build-status.json').is_file():
+            result = subprocess.run(['condor_wait', '-wait', '30', 'build.log', job_id],
+                                    cwd=context, capture_output=True, text=True)
+            if result.returncode == 0:
+                break
+            query = subprocess.run(['condor_q', job_id, '-json'], check=True,
+                                   capture_output=True, text=True)
+            jobs = json.loads(query.stdout)
+            if not jobs:
+                # A completed job can disappear from the queue before condor_wait
+                # notices its final event; inspect transferred status below.
+                break
+            if jobs[0].get('JobStatus') == 5:
+                fail('Build job ' + job_id + ' is held: ' + jobs[0].get('HoldReason', 'unknown reason')
+                     + '. Fix/release or remove it; then use --resume. Logs: ' + str(context))
+            time.sleep(1)
+    except KeyboardInterrupt:
+        fail('Stopped waiting; build job ' + job_id + ' remains queued/running. Resume with --resume ' + str(context))
+    status_file = context / 'build-status.json'
+    if not status_file.is_file():
+        fail('Build ended without a status report. Inspect ' + str(context / 'build.err'))
+    status = json.loads(status_file.read_text())
+    if status.get('exit_code') != 0 or not partial.is_file() or partial.stat().st_size == 0:
+        partial.unlink(missing_ok=True)
+        fail('Container build failed; inspect ' + str(context / 'build.err') + ' and build.out')
+    # Atomic no-clobber publication within the destination filesystem.
+    os.link(partial, output)
+    partial.unlink()
+    print('SIF image ready: ' + str(output))
+    print('Use with: chtc submit --image ' + shlex.quote(str(output)) + ' --gpus 1 SCRIPT.py')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest='mode', required=True)
+    for mode in ('submit', 'interactive', 'build'):
+        p = subs.add_parser(mode)
+        p.add_argument('--project', default='.', help='Project root; defaults to current directory')
+        p.add_argument('--exclude', action='append', default=[], help='Exclude source glob; repeatable')
+        p.add_argument('--max-source-mb', type=int, default=100)
+        if mode == 'build':
+            p.add_argument('--base', default='python:3.11-slim-bookworm')
+            p.add_argument('--uv-version', default='0.12.23')
+            p.add_argument('--tag', default='research:env-v1', help='Optional Docker image tag')
+            p.add_argument('--output', help='Destination .sif file; default PROJECT/.chtc/images/unique-name.sif')
+            p.add_argument('--backend', choices=['apptainer', 'docker'], default='apptainer')
+            p.add_argument('--prepare', action='store_true', help='Generate recipes without submitting/building')
+            p.add_argument('--resume', help='Submit a prepared build or resume waiting on a build directory')
+            p.add_argument('--cpus', type=int, default=4)
+            p.add_argument('--memory', default='16GB')
+            p.add_argument('--disk', default='40GB')
+            p.set_defaults(gpus=0, gpu_memory_mb=None)
+            p.add_argument('--extra', action='append', default=[])
+            p.add_argument('--venv', help='Export an existing venv instead of uv.lock, e.g. .venv')
+            p.add_argument('--index-url', help='Package index for exported venv packages (e.g. CUDA wheels)')
+            p.add_argument('--execute', action='store_true', help='Legacy alias for --backend docker')
+        else:
+            p.add_argument('--image', required=True, help='Registry image, .sif, or container URL')
+            resources(p)
+            p.add_argument('--input', action='append', default=[], help='Additional file or transfer URL')
+            p.add_argument('--prepare', action='store_true', help='Write files without submitting')
+            if mode == 'submit':
+                p.add_argument('script', help='Python script relative to the project')
+                p.add_argument('script_args', nargs=argparse.REMAINDER,
+                               help='Script arguments; put workflow options BEFORE the script')
+    args = parser.parse_args()
+    try:
+        if args.max_source_mb < 1:
+            fail('--max-source-mb must be positive')
+        if args.mode == 'build':
+            finish_build(args.resume) if args.resume else build(args)
+        else:
+            launch(args)
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        parser.exit(1, 'Error: ' + str(exc) + '\n')
+
+
+if __name__ == '__main__':
+    main()
